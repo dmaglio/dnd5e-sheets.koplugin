@@ -24,11 +24,13 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local InputDialog = require("ui/widget/inputdialog")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
+local Menu = require("ui/widget/menu")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local RightContainer = require("ui/widget/container/rightcontainer")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
+local TextViewer = require("ui/widget/textviewer")
 local TextWidget = require("ui/widget/textwidget")
 local TitleBar = require("ui/widget/titlebar")
 local UIManager = require("ui/uimanager")
@@ -38,12 +40,29 @@ local Utf8Proc = require("ffi/utf8proc")
 local util = require("util")
 local Screen = Device.screen
 
+local Classes = require("dnd5e_classes")
+local Species = require("dnd5e_species")
 local Data = require("dnd5e_data")
 local Dice = require("dnd5e_dice")
 local I18n = require("dnd5e_i18n")
+local Spells = require("dnd5e_spells")
 local T, F = I18n.T, I18n.F
 
 local signed = Dice.signed
+
+--- A copy of a list of { name = English name } sorted by translated name.
+local function sortedByName(list)
+    local out = {}
+    for _, v in ipairs(list) do table.insert(out, v) end
+    table.sort(out, function(a, b) return T(a.name) < T(b.name) end)
+    return out
+end
+
+--- First letter in upper case (for names shown alone on a button).
+local function ucfirst(text)
+    local ch = text:match("^[%z\1-\127\194-\244][\128-\191]*")
+    return ch and (Utf8Proc.uppercase_dumb(ch) .. text:sub(#ch + 1)) or text
+end
 local PIP_ON, PIP_OFF = "●", "○"
 
 local TABS = {
@@ -140,14 +159,11 @@ end
 
 function Sheet:subtitle()
     local c = self.character
-    local parts = {}
-    local class = util.trim(c.class or "")
-    if class ~= "" then
-        table.insert(parts, class .. " " .. (c.level or 1))
-    else
-        table.insert(parts, F("Level %d", c.level or 1))
-    end
-    if util.trim(c.race or "") ~= "" then table.insert(parts, c.race) end
+    local parts = { Data.classLine(c) }
+    -- the species without its lineage, to keep the line short
+    local sp = Species.get(c.species.key, c.edition)
+    local race = sp and T(sp.name) or util.trim(c.race or "")
+    if race ~= "" then table.insert(parts, race) end
     table.insert(parts, F("HP %d/%d", c.hp.current, c.hp.max))
     table.insert(parts, F("AC %s", tostring(c.ac)))
     table.insert(parts, c.edition)
@@ -854,20 +870,22 @@ function Sheet:rows_game()
     end))
 
     add(self:section(T("Hit dice")))
-    local left = c.hd.total - c.hd.used
-    add(self:labelButtons(string.format("d%d", c.hd.die), string.format("%d / %d", left, c.hd.total), {
-        { text = T("Spend & roll"), enabled = left > 0 and c.hp.current < c.hp.max, callback = function()
-            local con = Data.abilityMod(c, "con")
-            local roll = Dice.die(c.hd.die)
-            local healed = math.max(0, roll + con)
-            c.hd.used = c.hd.used + 1
-            Data.heal(c, healed)
-            self:report(F("Hit die: d%d [%d] %s %d = %d HP → %d/%d", c.hd.die, roll,
-                con >= 0 and "+" or "−", math.abs(con), healed, c.hp.current, c.hp.max))
-        end },
-        { text = "+1", enabled = c.hd.used > 0, callback = function()
-            c.hd.used = c.hd.used - 1; self:changed() end },
-    }, function() self:editHitDice() end))
+    for _, pool in ipairs(Data.hitDice(c)) do
+        local left = pool.total - pool.spent
+        add(self:labelButtons(string.format("d%d", pool.die), string.format("%d / %d", left, pool.total), {
+            { text = T("Spend & roll"), enabled = left > 0 and c.hp.current < c.hp.max, callback = function()
+                local con = Data.abilityMod(c, "con")
+                local roll = Dice.die(pool.die)
+                local healed = math.max(0, roll + con)
+                Data.setSpentHitDice(c, pool.die, pool.spent + 1)
+                Data.heal(c, healed)
+                self:report(F("Hit die: d%d [%d] %s %d = %d HP → %d/%d", pool.die, roll,
+                    con >= 0 and "+" or "−", math.abs(con), healed, c.hp.current, c.hp.max))
+            end },
+            { text = "+1", enabled = pool.spent > 0, callback = function()
+                Data.setSpentHitDice(c, pool.die, pool.spent - 1); self:changed() end },
+        }, function() self:editHitDice() end))
+    end
 
     add(self:section(T("Death saves")))
     add(self:pips(T("Successes"), 3, c.death.success, function(n) c.death.success = n; self:changed() end))
@@ -916,6 +934,10 @@ end
 
 function Sheet:editHitDice()
     local c = self.character
+    if #c.classes > 0 and not self:hasCustomClass() then
+        self:editClasses()
+        return
+    end
     local list = {}
     for _, d in ipairs(Data.HIT_DICE) do
         table.insert(list, { text = "d" .. d .. (d == c.hd.die and "  ✓" or ""), value = d })
@@ -926,7 +948,6 @@ function Sheet:editHitDice()
             UIManager:nextTick(function()
                 self:editNumber(T("Total number of hit dice"), c.hd.total, function(n)
                     c.hd.total = n
-                    c.hd.used = math.min(c.hd.used, n)
                 end, { min = 1, max = 40 })
             end)
         else
@@ -963,9 +984,7 @@ function Sheet:rows_abilities()
     local rows = {}
     local function add(w) table.insert(rows, w) end
     add(self:section(T("General")))
-    add(self:kv(T("Level"), c.level, function()
-        self:editNumber(T("Level"), c.level, function(n) c.level = n end, { min = 1, max = 20 })
-    end))
+    add(self:levelRow())
     add(self:kv(T("Proficiency bonus") .. (c.prof_override and " " .. T("(manual)") or ""),
         signed(Data.profBonus(c)), function()
             self:choose(T("Proficiency bonus"), {
@@ -1224,22 +1243,507 @@ function Sheet:spellMenu(spell)
     if spell.time and spell.time ~= "" then table.insert(details, F("Casting time: %s", spell.time)) end
     if spell.range and spell.range ~= "" then table.insert(details, F("Range: %s", spell.range)) end
     if spell.notes and spell.notes ~= "" then table.insert(details, spell.notes) end
+    local srd = Spells.get(c.edition, spell.srd)
+    local buttons = {
+        { flag("conc", T("Concentration")), flag("ritual", T("Ritual")), flag("material", T("Material")) },
+    }
+    if srd then
+        table.insert(buttons, { { text = T("Description"), callback = function()
+            UIManager:close(dialog); self:showSpellText(srd) end } })
+    end
+    table.insert(buttons, { { text = T("Edit"), callback = function()
+        UIManager:close(dialog); self:editSpell(spell, false) end } })
+    table.insert(buttons, { { text = T("Delete"), callback = function()
+        UIManager:close(dialog)
+        for i, s in ipairs(c.spell.list) do
+            if s == spell then table.remove(c.spell.list, i) break end
+        end
+        self:changed()
+    end } })
     dialog = ButtonDialog:new{
         title = spell.name .. (#details > 0 and ("\n" .. table.concat(details, "\n")) or ""),
-        buttons = {
-            { flag("conc", T("Concentration")), flag("ritual", T("Ritual")), flag("material", T("Material")) },
-            { { text = T("Edit"), callback = function()
-                UIManager:close(dialog); self:editSpell(spell, false) end } },
-            { { text = T("Delete"), callback = function()
-                UIManager:close(dialog)
-                for i, s in ipairs(c.spell.list) do
-                    if s == spell then table.remove(c.spell.list, i) break end
-                end
-                self:changed()
-            end } },
-        },
+        buttons = buttons,
     }
     UIManager:show(dialog)
+end
+
+-- Classes and levels ----------------------------------------------------------
+
+function Sheet:classNames()
+    local names = {}
+    for _, e in ipairs(self.character.classes) do table.insert(names, Classes.entryName(e)) end
+    return table.concat(names, " / ")
+end
+
+function Sheet:hasCustomClass()
+    for _, e in ipairs(self.character.classes) do
+        if not e.key then return true end
+    end
+    return false
+end
+
+--- Level row: the total of the classes, or a number typed by hand.
+function Sheet:levelRow()
+    local c = self.character
+    if #c.classes > 0 then
+        return self:kv(T("Level"), c.level, function() self:editClasses() end)
+    end
+    return self:kv(T("Level"), c.level, function()
+        self:editNumber(T("Level"), c.level, function(n) c.level = n end, { min = 1, max = 20 })
+    end)
+end
+
+--- Apply a change to the class list, then show the list again.
+function Sheet:changeClasses(fn)
+    local c = self.character
+    local first_before = c.classes[1] and c.classes[1].key
+    fn(c.classes)
+    Data.classesChanged(c, first_before)
+    self:changed()
+    UIManager:nextTick(function() self:editClasses() end)
+end
+
+function Sheet:editClasses()
+    local c = self.character
+    local dialog
+    local buttons = {}
+    for i, e in ipairs(c.classes) do
+        local sub = Classes.entrySubclass(e, c.edition)
+        table.insert(buttons, { {
+            text = Classes.entryName(e) .. " " .. (e.level or 1) .. (sub and ("  ·  " .. sub) or ""),
+            callback = function()
+                UIManager:close(dialog)
+                self:classMenu(i)
+            end,
+        } })
+    end
+    table.insert(buttons, { {
+        text = #c.classes == 0 and T("+ Choose the class") or T("+ Add a class (multiclass)"),
+        callback = function()
+            UIManager:close(dialog)
+            self:chooseClass(nil)
+        end,
+    } })
+    local title = T("Classes and levels")
+    if #c.classes > 0 then
+        title = title .. "\n" .. F("Total level: %d", c.level)
+    else
+        title = title .. "\n" .. T("Choosing a class fills in hit dice, saving throws and spellcasting.")
+    end
+    if #c.classes > 1 then
+        title = title .. "\n" .. T("Saving throw proficiencies come from the first class.")
+    end
+    dialog = ButtonDialog:new{ title = title, buttons = buttons }
+    UIManager:show(dialog)
+end
+
+function Sheet:classMenu(i)
+    local c = self.character
+    local e = c.classes[i]
+    local dialog
+    local sub = Classes.entrySubclass(e, c.edition)
+    local buttons = {
+        { { text = F("Class: %s", Classes.entryName(e)), callback = function()
+            UIManager:close(dialog); self:chooseClass(i) end } },
+        { { text = F("Subclass: %s", sub or "—"), callback = function()
+            UIManager:close(dialog); self:chooseSubclass(i) end } },
+        { { text = F("Level: %d", e.level or 1), callback = function()
+            UIManager:close(dialog)
+            self:editNumber(F("%s: level", Classes.entryName(e)), e.level or 1, function(n)
+                self:changeClasses(function() e.level = n end)
+            end, { min = 1, max = 20 })
+        end } },
+        { { text = T("Remove this class"), callback = function()
+            UIManager:close(dialog)
+            self:confirm(F("Remove «%s» from the classes?", Classes.entryName(e)), T("Remove"), function()
+                self:changeClasses(function(list) table.remove(list, i) end)
+            end)
+        end } },
+        { { text = T("Back"), callback = function()
+            UIManager:close(dialog); self:editClasses() end } },
+    }
+    dialog = ButtonDialog:new{ title = Classes.entryName(e) .. " " .. (e.level or 1), buttons = buttons }
+    UIManager:show(dialog)
+end
+
+--- Pick a class for entry i, or for a new entry if i is nil.
+function Sheet:chooseClass(i)
+    local c = self.character
+    local current = i and c.classes[i]
+    local dialog
+    local function set(key, name)
+        self:changeClasses(function(list)
+            if current then
+                if current.key ~= key or key == nil then current.sub, current.sub_name = nil, nil end
+                current.key, current.name = key, name
+            else
+                -- the first class takes the level already on the sheet
+                table.insert(list, { key = key, name = name, level = #list == 0 and (c.level or 1) or 1 })
+            end
+        end)
+    end
+    local buttons, row = {}, {}
+    for _, cl in ipairs(sortedByName(Classes.LIST)) do
+        table.insert(row, {
+            text = T(cl.name) .. (current and current.key == cl.key and "  ✓" or ""),
+            callback = function()
+                UIManager:close(dialog)
+                set(cl.key, nil)
+            end,
+        })
+        if #row == 2 then
+            table.insert(buttons, row)
+            row = {}
+        end
+    end
+    table.insert(buttons, { {
+        text = T("Other…"),
+        callback = function()
+            UIManager:close(dialog)
+            self:editText(T("Class"), current and current.name or "", function(t)
+                if t == "" then return end
+                local key = Classes.fromText(t)
+                set(key, not key and t or nil)
+            end)
+        end,
+    } })
+    dialog = ButtonDialog:new{ title = T("Class"), buttons = buttons }
+    UIManager:show(dialog)
+end
+
+function Sheet:chooseSubclass(i)
+    local c = self.character
+    local e = c.classes[i]
+    local function typed()
+        self:editText(T("Subclass"), e.sub_name or "", function(t)
+            self:changeClasses(function()
+                local key = e.key and Classes.subclassFromText(e.key, t, c.edition)
+                e.sub, e.sub_name = key, (not key and t ~= "") and t or nil
+            end)
+        end)
+    end
+    local list = Classes.subclasses(e.key, c.edition)
+    if #list == 0 then
+        typed()
+        return
+    end
+    local dialog
+    local buttons = {}
+    for _, s in ipairs(list) do
+        table.insert(buttons, { {
+            text = T(s.name) .. (e.sub == s.key and "  ✓" or ""),
+            callback = function()
+                UIManager:close(dialog)
+                self:changeClasses(function() e.sub, e.sub_name = s.key, nil end)
+            end,
+        } })
+    end
+    table.insert(buttons, { {
+        text = T("Other…"),
+        callback = function() UIManager:close(dialog); typed() end,
+    }, {
+        text = T("None"),
+        callback = function()
+            UIManager:close(dialog)
+            self:changeClasses(function() e.sub, e.sub_name = nil, nil end)
+        end,
+    } })
+    dialog = ButtonDialog:new{
+        title = F("%s: subclass", Classes.entryName(e)),
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+-- Alignment -------------------------------------------------------------------
+
+function Sheet:chooseAlignment()
+    local c = self.character
+    local dialog
+    local function set(key, text)
+        c.alignment_key = key
+        c.alignment = key and T(key) or text
+        self:changed()
+    end
+    local buttons = {}
+    for first = 1, 9, 3 do
+        local row = {}
+        for i = first, first + 2 do
+            local name = Data.ALIGNMENTS[i]
+            table.insert(row, {
+                text = T(name) .. (c.alignment_key == name and "  ✓" or ""),
+                callback = function() UIManager:close(dialog); set(name) end,
+            })
+        end
+        table.insert(buttons, row)
+    end
+    table.insert(buttons, { {
+        text = T("Other…"),
+        callback = function()
+            UIManager:close(dialog)
+            self:editText(T("Alignment"), c.alignment, function(t)
+                set(Data.alignmentFromText(t), t)
+            end)
+        end,
+    }, {
+        text = T("None"),
+        callback = function() UIManager:close(dialog); set(nil, "") end,
+    } })
+    dialog = ButtonDialog:new{ title = T("Alignment"), buttons = buttons }
+    UIManager:show(dialog)
+end
+
+-- Species ---------------------------------------------------------------------
+
+function Sheet:chooseSpecies()
+    local c = self.character
+    local label = self:is2024() and T("Species") or T("Race")
+    local dialog
+    local function set(key, sub, text)
+        c.species = { key = key, sub = sub }
+        if not key then c.race = text end
+        Data.speciesChanged(c)
+        self:changed()
+    end
+    local buttons, row = {}, {}
+    for _, sp in ipairs(sortedByName(Species.list(c.edition))) do
+        table.insert(row, {
+            text = T(sp.name) .. (c.species.key == sp.key and "  ✓" or ""),
+            callback = function()
+                UIManager:close(dialog)
+                if sp.subs then
+                    self:chooseSpeciesSub(sp, set)
+                else
+                    set(sp.key, nil)
+                end
+            end,
+        })
+        if #row == 2 then
+            table.insert(buttons, row)
+            row = {}
+        end
+    end
+    if #row > 0 then table.insert(buttons, row) end
+    table.insert(buttons, { {
+        text = T("Other…"),
+        callback = function()
+            UIManager:close(dialog)
+            self:editText(label, Species.line(c), function(t)
+                local key, sub = Species.fromText(t, c.edition)
+                set(key, sub, t)
+            end)
+        end,
+    } })
+    dialog = ButtonDialog:new{
+        title = label .. "\n" .. T("Speed and size are filled in; you can change them."),
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+function Sheet:chooseSpeciesSub(sp, set)
+    local c = self.character
+    local dialog
+    local buttons = {}
+    for _, sub in ipairs(sp.subs) do
+        table.insert(buttons, { {
+            text = ucfirst(T(sub.name)) .. (c.species.key == sp.key and c.species.sub == sub.key and "  ✓" or ""),
+            callback = function()
+                UIManager:close(dialog)
+                set(sp.key, sub.key)
+            end,
+        } })
+    end
+    table.insert(buttons, { {
+        text = T("Choose later"),
+        callback = function()
+            UIManager:close(dialog)
+            set(sp.key, nil)
+        end,
+    } })
+    dialog = ButtonDialog:new{ title = T(sp.name), buttons = buttons }
+    UIManager:show(dialog)
+end
+
+-- Spells from the SRD lists ---------------------------------------------------
+
+--- Class used to filter the spell lists: the one chosen in the Spells tab,
+-- else a class recognized in its free text or in the character's class.
+function Sheet:spellClassKey()
+    local c = self.character
+    if c.spell.class_key then return c.spell.class_key end
+    for _, e in ipairs(c.classes) do
+        local list = Classes.entrySpellcasting(e, c.edition)
+        if list then return list end
+    end
+    return Spells.classFromText(c.spell.class) or Spells.classFromText(c.class)
+end
+
+function Sheet:chooseSpellClass()
+    local sp = self.character.spell
+    local dialog
+    local buttons, row = {}, {}
+    for _, cl in ipairs(sortedByName(Spells.CLASSES)) do
+        table.insert(row, {
+            text = T(cl.name) .. (sp.class_key == cl.key and "  ✓" or ""),
+            callback = function()
+                UIManager:close(dialog)
+                sp.class_key = cl.key
+                sp.class = T(cl.name)
+                sp.ability = cl.ability
+                self:changed()
+            end,
+        })
+        if #row == 2 then
+            table.insert(buttons, row)
+            row = {}
+        end
+    end
+    table.insert(buttons, { {
+        text = T("Other…"),
+        callback = function()
+            UIManager:close(dialog)
+            self:editText(T("Spellcasting class"), sp.class, function(t)
+                sp.class = t
+                sp.class_key = Spells.classFromText(t)
+            end)
+        end,
+    } })
+    dialog = ButtonDialog:new{
+        title = T("Spellcasting class") .. "\n" .. T("The spellcasting ability is set too; you can change it."),
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+function Sheet:hasSpell(s)
+    for _, spell in ipairs(self.character.spell.list) do
+        if spell.srd == s.id or spell.name:lower() == s.name:lower() then return true end
+    end
+    return false
+end
+
+function Sheet:addSrdSpell(s)
+    table.insert(self.character.spell.list, {
+        name = s.name,
+        level = s.level,
+        time = s.time,
+        range = s.range,
+        notes = "",
+        conc = s.conc or nil,
+        ritual = s.ritual or nil,
+        material = (s.comp or ""):find("M") and true or nil,
+        srd = s.id,
+    })
+    self:changed()
+end
+
+--- Description of a spell; with on_add, a button adds it to the sheet.
+function Sheet:showSpellText(s, on_add)
+    local viewer
+    local buttons = { {
+        { text = T("Close"), callback = function() UIManager:close(viewer) end },
+    } }
+    if on_add then
+        local known = self:hasSpell(s)
+        table.insert(buttons[1], {
+            text = known and T("On the sheet ✓") or T("Add to the sheet"),
+            enabled = not known,
+            callback = function()
+                UIManager:close(viewer)
+                on_add()
+            end,
+        })
+    end
+    viewer = TextViewer:new{
+        title = s.name,
+        text = Spells.html(s),
+        text_format = "html",
+        buttons_table = buttons,
+    }
+    UIManager:show(viewer)
+end
+
+--- Choose a level, then a spell from the list of the character's class.
+function Sheet:pickSpellLevel(all_classes)
+    local c = self.character
+    local class = self:spellClassKey()
+    local filter = (not all_classes) and class or nil
+    if not Spells.load(c.edition) then
+        UIManager:show(InfoMessage:new{ text = T("The spell list could not be read."), timeout = 3 })
+        return
+    end
+    local counts = Spells.counts(c.edition, filter)
+    local dialog
+    local function level_button(lvl)
+        local label = lvl == 0 and T("Cantrips") or F("Level %d", lvl)
+        return {
+            text = label .. "  (" .. counts[lvl] .. ")",
+            enabled = counts[lvl] > 0,
+            callback = function()
+                UIManager:close(dialog)
+                self:showSpellList(lvl, filter)
+            end,
+        }
+    end
+    local buttons = { { level_button(0) } }
+    for first = 1, 9, 3 do
+        table.insert(buttons, { level_button(first), level_button(first + 1), level_button(first + 2) })
+    end
+    local title
+    if filter then
+        title = F("Spells: %s", Spells.className(filter))
+        table.insert(buttons, { { text = T("Show all classes"), callback = function()
+            UIManager:close(dialog); self:pickSpellLevel(true) end } })
+    else
+        title = T("Spells: all classes")
+        if class then
+            table.insert(buttons, { { text = F("Only %s", Spells.className(class)), callback = function()
+                UIManager:close(dialog); self:pickSpellLevel(false) end } })
+        end
+    end
+    if not class then
+        title = title .. "\n" .. T("Choose the spellcasting class to see only its spells.")
+    end
+    title = title .. "\n\n" .. Spells.source(c.edition)
+    dialog = ButtonDialog:new{ title = title, buttons = buttons }
+    UIManager:show(dialog)
+end
+
+function Sheet:showSpellList(level, class)
+    local c = self.character
+    local menu
+    local function items()
+        local list = {}
+        for _, s in ipairs(Spells.list(c.edition, level, class)) do
+            local tags = {}
+            if s.conc then table.insert(tags, T("C")) end
+            if s.ritual then table.insert(tags, T("R")) end
+            if self:hasSpell(s) then table.insert(tags, "✓") end
+            table.insert(list, {
+                text = s.name,
+                mandatory = table.concat(tags, " "),
+                callback = function()
+                    self:showSpellText(s, function()
+                        self:addSrdSpell(s)
+                        menu:switchItemTable(nil, items(), -1)
+                        UIManager:show(InfoMessage:new{ text = F("Added «%s».", s.name), timeout = 1 })
+                    end)
+                end,
+            })
+        end
+        return list
+    end
+    menu = Menu:new{
+        title = level == 0 and T("Cantrips") or F("Level %d spells", level),
+        subtitle = (class and Spells.className(class) or T("All classes")) .. " · " .. T("✓ = on the sheet"),
+        item_table = items(),
+        is_borderless = true,
+        is_popout = false,
+        covers_fullscreen = true,
+        single_line = true,
+    }
+    UIManager:show(menu)
 end
 
 function Sheet:rows_spells()
@@ -1250,9 +1754,8 @@ function Sheet:rows_spells()
     local ab = Data.ABILITY_BY_KEY[sp.ability] or Data.ABILITY_BY_KEY.int
 
     add(self:section(T("Spellcasting")))
-    add(self:kv(T("Spellcasting class"), sp.class ~= "" and sp.class or "—", function()
-        self:editText(T("Spellcasting class"), sp.class, function(t) sp.class = t end)
-    end))
+    local class_label = sp.class_key and Spells.className(sp.class_key) or (sp.class ~= "" and sp.class) or "—"
+    add(self:kv(T("Spellcasting class"), class_label, function() self:chooseSpellClass() end))
     add(self:kv(T("Spellcasting ability"), T(ab.name), function()
         local list = {}
         for _, a in ipairs(Data.ABILITIES) do
@@ -1318,7 +1821,8 @@ function Sheet:rows_spells()
         add(self:caption(T("Tap a spell for its details and to mark C (concentration), R (ritual), M (material). ● = prepared.")))
     end
     add(self:buttons{
-        { text = T("+ Add spell"), callback = function() self:editSpell({ level = 0 }, true) end },
+        { text = T("+ From the list"), callback = function() self:pickSpellLevel(false) end },
+        { text = T("+ Write one"), callback = function() self:editSpell({ level = 0 }, true) end },
     })
     return rows
 end
@@ -1402,9 +1906,18 @@ function Sheet:rows_bio()
         end))
     end
     local function level()
-        add(self:kv(T("Level"), c.level, function()
-            self:editNumber(T("Level"), c.level, function(n) c.level = n end, { min = 1, max = 20 })
-        end))
+        add(self:levelRow())
+    end
+    local function speciesField(label)
+        local value = Species.line(c)
+        add(self:kv(label, value ~= "" and value or "—", function() self:chooseSpecies() end))
+    end
+    local function alignmentField()
+        local a = c.alignment_key and T(c.alignment_key) or c.alignment
+        add(self:kv(T("Alignment"), a ~= "" and a or "—", function() self:chooseAlignment() end))
+    end
+    local function classField(label, value)
+        add(self:kv(label, value ~= "" and value or "—", function() self:editClasses() end))
     end
     local function xp()
         add(self:kv(T("Experience points"), c.xp, function()
@@ -1414,13 +1927,13 @@ function Sheet:rows_bio()
     if self:is2024() then
         add(self:section(T("Character")))
         textField(T("Character name"), "name")
-        textField(T("Class"), "class")
-        textField(T("Subclass"), "subclass")
+        classField(T("Class"), #c.classes > 0 and self:classNames() or c.class)
+        classField(T("Subclass"), #c.classes > 0 and Data.subclassLine(c) or c.subclass)
         level()
-        textField(T("Species"), "race")
+        speciesField(T("Species"))
         textField(T("Background"), "background")
         textField(T("Size"), "size")
-        textField(T("Alignment"), "alignment")
+        alignmentField()
         xp()
         add(self:section(T("Appearance")))
         add(self:textBlock(nil, c.appearance, function(t) c.appearance = t end, 5))
@@ -1431,11 +1944,11 @@ function Sheet:rows_bio()
     add(self:section(T("Character")))
     textField(T("Character name"), "name")
     textField(T("Player name"), "player")
-    textField(T("Class"), "class")
+    classField(T("Class"), #c.classes > 0 and Data.classLine(c) or c.class)
     level()
-    textField(T("Race"), "race")
+    speciesField(T("Race"))
     textField(T("Background"), "background")
-    textField(T("Alignment"), "alignment")
+    alignmentField()
     xp()
     add(self:section(T("Appearance")))
     textField(T("Age"), "age")

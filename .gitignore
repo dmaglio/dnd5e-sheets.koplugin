@@ -1,2 +1,4 @@
 dist/
 *.old
+__pycache__/
+srd-work/

@@ -63,16 +63,16 @@ end
 
 function DnD:openSheet(c)
     G_reader_settings:saveSetting("dnd5e_last", c.id)
+    -- without a refresh type, show() repaints but doesn't refresh the screen:
+    -- e-ink would only update the area of the tapped list item
     UIManager:show(Sheet:new{
         character = c,
         on_close = function() self:refreshList() end,
-    })
+    }, "flashui")
 end
 
 local function describe(c)
-    local parts = {}
-    local class = util.trim(c.class or "")
-    table.insert(parts, class ~= "" and (class .. " " .. (c.level or 1)) or F("Level %d", c.level or 1))
+    local parts = { Data.classLine(c) }
     if util.trim(c.race or "") ~= "" then table.insert(parts, c.race) end
     table.insert(parts, c.edition)
     return table.concat(parts, " · ")
